@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Describe the appliance",
+        "description": "Tell Appliance Shield about the fridge or freezer so we can build the right reference profile.",
+        "data": {
+          "name": "Friendly name",
+          "appliance_type": "Appliance type",
+          "volume_liters": "Net volume (L)",
+          "freezer_volume_liters": "Freezer volume (L, optional)",
+          "climate_class": "Climate class",
+          "target_annual_kwh": "Manufacturer annual energy (kWh)"
+        }
+      },
+      "sources": {
+        "title": "Link telemetry sensors",
+        "description": "Select the existing sensor entities that expose power (W) and cumulative energy (kWh).",
+        "data": {
+          "power_entity_id": "Power sensor (W)",
+          "energy_entity_id": "Energy sensor (kWh)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This appliance is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Appliance Shield options",
+        "description": "Tune coordinator behavior.",
+        "data": {
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    }
+  }
+}
