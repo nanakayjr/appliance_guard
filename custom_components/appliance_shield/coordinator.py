@@ -1,33 +1,23 @@
-"""Data coordinator for Appliance Shield."""
+"""Data coordinator for Appliance Shield v0.3."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional
 import logging
-import math
 
 from homeassistant.const import CONF_NAME, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
-from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
+from .ambient import AmbientModel
+from .baseline import BaselineModel
 from .const import (
     APPLIANCE_TYPES,
-    ATTR_DAILY_ENERGY_KWH,
-    ATTR_EEI,
-    ATTR_EXPECTED_DAILY_KWH,
-    ATTR_EXTENDED_SCORE,
-    ATTR_ISSUES,
-    ATTR_LAST_SAMPLE,
-    ATTR_METADATA,
-    ATTR_OBSERVED_ANNUAL_KWH,
-    ATTR_REFERENCE_ANNUAL_KWH,
-    ATTR_RUNTIME_RATIO,
-    ATTR_SAMPLE_WINDOW_HOURS,
-    CLIMATE_CLASS_MULTIPLIERS,
+    CONF_AMBIENT_SENSOR,
     CONF_APPLIANCE_TYPE,
     CONF_CLIMATE_CLASS,
     CONF_ENERGY_SENSOR,
@@ -35,37 +25,23 @@ from .const import (
     CONF_POWER_SENSOR,
     CONF_TARGET_ANNUAL_KWH,
     CONF_VOLUME_LITERS,
-    CYCLE_LONG_SIGMA,
-    CYCLE_SHORT_SIGMA,
-    DEFAULT_REFERENCE_TABLE,
+    CONF_WEATHER_ENTITY,
     DEFAULT_SCAN_INTERVAL,
-    ENERGY_SCORE_EXTENDED,
-    ENERGY_SCORE_PRIMARY,
-    EWMA_ALPHA,
-    HEALTH_STATE_ATTENTION,
-    HEALTH_STATE_CRITICAL,
-    HEALTH_STATE_HEALTHY,
-    HEALTH_STATE_INITIALIZING,
-    IDLE_TIMEOUT_MINUTES_MIN,
-    IDLE_TIMEOUT_MULTIPLIER,
+    DOMAIN,
     MAX_HISTORY_MINUTES,
-    MIN_RESIDUAL_SAMPLES,
     POWER_RUNNING_THRESHOLD_W,
     POWER_SPIKE_THRESHOLD_W,
-    RESIDUAL_SIGMA_ATTENTION,
-    RESIDUAL_SIGMA_CRITICAL,
-    SIGNATURE_MIN_CYCLES,
-    STALL_PEAK_THRESHOLD_W,
-    STANDBY_HIGH_W,
 )
+from .eei import compute_eei
+from .health import HealthEvaluator, HealthResult
+from .signal_processing import CycleDetector, CycleSummary
+from .storage import ApplianceShieldStorage
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class RunningStats:
-    """Online mean and variance tracker."""
-
-    __slots__ = ("count", "mean", "_m2")
+    """Online mean/variance helper."""
 
     def __init__(self) -> None:
         self.count = 0
@@ -80,203 +56,37 @@ class RunningStats:
         self._m2 += delta * delta2
 
     @property
-    def variance(self) -> Optional[float]:
+    def std(self) -> Optional[float]:
         if self.count < 2:
             return None
-        return self._m2 / (self.count - 1)
-
-    @property
-    def std(self) -> Optional[float]:
-        variance = self.variance
-        if variance is None or variance < 0:
+        variance = self._m2 / (self.count - 1)
+        if variance < 0:
             return None
-        return math.sqrt(variance)
+        return variance ** 0.5
 
-    def snapshot(self) -> Dict[str, Optional[float | int]]:
-        """Return a serializable view of the stats."""
-        std = self.std
-        return {
-            "mean": round(self.mean, 3) if self.count else None,
-            "std": round(std, 3) if std is not None else None,
-            "count": self.count,
-        }
+    def as_dict(self) -> Dict[str, float | int]:
+        return {"count": self.count, "mean": self.mean, "m2": self._m2}
 
-
-@dataclass
-class CycleSnapshot:
-    """Structured snapshot of compressor cycle features."""
-
-    state: str
-    signature_ready: bool
-    idle_hours: Optional[float]
-    last_on_minutes: Optional[float]
-    last_avg_power_w: Optional[float]
-    last_peak_power_w: Optional[float]
-    standby_mean_w: Optional[float]
-    feature_stats: Dict[str, Dict[str, Optional[float | int]]]
-
-
-class CycleTracker:
-    """Tracks compressor cycles using coarse-grained power samples."""
-
-    def __init__(self) -> None:
-        self._last_running: Optional[bool] = None
-        self._current_on_start: Optional[datetime] = None
-        self._current_sum = 0.0
-        self._current_count = 0
-        self._current_peak = 0.0
-        self._last_off_start: Optional[datetime] = None
-        self._last_cycle_end: Optional[datetime] = None
-        self._last_on_minutes: Optional[float] = None
-        self._last_avg_power: Optional[float] = None
-        self._last_peak_power: Optional[float] = None
-        self._state = "calibrating"
-        self._on_stats = RunningStats()
-        self._off_stats = RunningStats()
-        self._avg_power_stats = RunningStats()
-        self._standby_stats = RunningStats()
-
-    def update(self, timestamp: datetime, power: Optional[float]) -> CycleSnapshot:
-        running = power is not None and power >= POWER_RUNNING_THRESHOLD_W
-
-        if self._last_running is None:
-            # Initialize state machine without classification.
-            self._last_running = running
-            if running:
-                self._start_on(timestamp, power)
-            else:
-                self._last_off_start = timestamp
-            return self._snapshot(timestamp)
-
-        sample_recorded = False
-        if running and not self._last_running:
-            self._handle_off_to_on(timestamp)
-            self._start_on(timestamp, power)
-            sample_recorded = True
-        elif not running and self._last_running:
-            self._handle_on_to_off(timestamp)
-            self._last_off_start = timestamp
-
-        if running:
-            if self._current_on_start is None:
-                self._start_on(timestamp, power)
-                sample_recorded = True
-            elif not sample_recorded and power is not None:
-                self._current_sum += power
-                self._current_count += 1
-                self._current_peak = max(self._current_peak, power)
-        else:
-            if power is not None:
-                self._standby_stats.update(power)
-            if self._last_off_start is None:
-                self._last_off_start = timestamp
-
-        self._last_running = running
-        self._state = self._classify(timestamp)
-        return self._snapshot(timestamp)
-
-    def _handle_off_to_on(self, timestamp: datetime) -> None:
-        if self._last_off_start is None:
+    def load(self, data: Optional[Dict[str, float | int]]) -> None:
+        if not data:
             return
-        off_minutes = (timestamp - self._last_off_start).total_seconds() / 60
-        if off_minutes > 0:
-            self._off_stats.update(off_minutes)
-        self._last_off_start = None
+        self.count = int(data.get("count", 0))
+        self.mean = float(data.get("mean", 0.0))
+        self._m2 = float(data.get("m2", 0.0))
 
-    def _handle_on_to_off(self, timestamp: datetime) -> None:
-        if self._current_on_start is None:
-            return
-        on_minutes = (timestamp - self._current_on_start).total_seconds() / 60
-        if on_minutes > 0:
-            avg_power = (self._current_sum / self._current_count) if self._current_count else None
-            if avg_power is not None:
-                self._avg_power_stats.update(avg_power)
-            self._on_stats.update(on_minutes)
-            self._last_on_minutes = round(on_minutes, 2)
-            self._last_avg_power = round(avg_power, 2) if avg_power is not None else None
-            self._last_peak_power = round(self._current_peak, 2) if self._current_peak else None
-            self._last_cycle_end = timestamp
-
-        self._current_on_start = None
-        self._current_sum = 0.0
-        self._current_count = 0
-        self._current_peak = 0.0
-
-    def _start_on(self, timestamp: datetime, power: Optional[float]) -> None:
-        self._current_on_start = timestamp
-        self._current_sum = power or POWER_RUNNING_THRESHOLD_W
-        self._current_count = 1
-        self._current_peak = power or POWER_RUNNING_THRESHOLD_W
-
-    def _idle_hours(self, timestamp: datetime) -> Optional[float]:
-        if self._last_cycle_end is None:
-            return None
-        idle_hours = (timestamp - self._last_cycle_end).total_seconds() / 3600
-        return round(idle_hours, 3)
-
-    def _mean_cycle_period_minutes(self) -> Optional[float]:
-        if self._on_stats.count < 1 or self._off_stats.count < 1:
-            return None
-        return self._on_stats.mean + self._off_stats.mean
-
-    def _classify(self, timestamp: datetime) -> str:
-        idle_hours = self._idle_hours(timestamp)
-        mean_period = self._mean_cycle_period_minutes()
-        if idle_hours is not None and mean_period:
-            idle_minutes = idle_hours * 60
-            idle_threshold = max(IDLE_TIMEOUT_MULTIPLIER * mean_period, IDLE_TIMEOUT_MINUTES_MIN)
-            if idle_minutes > idle_threshold:
-                return "idle"
-
-        if self._on_stats.count < SIGNATURE_MIN_CYCLES or self._off_stats.count < SIGNATURE_MIN_CYCLES:
-            return "calibrating"
-
-        if self._last_peak_power is not None and self._last_peak_power < STALL_PEAK_THRESHOLD_W:
-            return "stalled_cycle"
-
-        std_on = self._on_stats.std or 0.0
-        if self._last_on_minutes is not None and std_on > 0:
-            lower = self._on_stats.mean - CYCLE_SHORT_SIGMA * std_on
-            upper = self._on_stats.mean + CYCLE_LONG_SIGMA * std_on
-            if self._last_on_minutes < lower:
-                return "short_cycle"
-            if self._last_on_minutes > upper:
-                return "long_cycle"
-
-        return "normal"
-
-    def _feature_stats(self) -> Dict[str, Dict[str, Optional[float]]]:
-        return {
-            "on_minutes": self._on_stats.snapshot(),
-            "off_minutes": self._off_stats.snapshot(),
-            "avg_power_w": self._avg_power_stats.snapshot(),
-            "standby_power_w": self._standby_stats.snapshot(),
-        }
-
-    def _snapshot(self, timestamp: datetime) -> CycleSnapshot:
-        idle_hours = self._idle_hours(timestamp)
-        standby_mean = self._standby_stats.mean if self._standby_stats.count else None
-        return CycleSnapshot(
-            state=self._state,
-            signature_ready=(
-                self._on_stats.count >= SIGNATURE_MIN_CYCLES and self._off_stats.count >= SIGNATURE_MIN_CYCLES
-            ),
-            idle_hours=idle_hours,
-            last_on_minutes=self._last_on_minutes,
-            last_avg_power_w=self._last_avg_power,
-            last_peak_power_w=self._last_peak_power,
-            standby_mean_w=round(standby_mean, 2) if standby_mean is not None else None,
-            feature_stats=self._feature_stats(),
-        )
 
 @dataclass
 class ApplianceDiagnostics:
-    """Snapshot of appliance telemetry and analytics."""
+    """Snapshot returned to HA entities and diagnostics."""
 
     health_state: str
+    health_score: float
     issues: List[str]
     instantaneous_power_w: Optional[float]
+    ambient_temp_c: Optional[float]
     daily_energy_kwh: Optional[float]
+    normalized_daily_kwh: Optional[float]
+    ewma_daily_kwh: Optional[float]
     runtime_ratio: Optional[float]
     observed_annual_kwh: Optional[float]
     expected_daily_kwh: Optional[float]
@@ -287,38 +97,44 @@ class ApplianceDiagnostics:
     sample_window_hours: float
     last_sample_utc: Optional[str]
     metadata: Dict[str, Optional[float | str]]
-    cycle_state: str
+    compressor_running: bool
+    door_open: bool
+    confidence: float
     idle_hours: Optional[float]
-    ewma_daily_kwh: Optional[float]
-    energy_residual_kwh: Optional[float]
-    residual_sigma: Optional[float]
-    signature_ready: bool
-    feature_stats: Dict[str, Dict[str, Optional[float | int]]]
     last_cycle_minutes: Optional[float]
     last_cycle_peak_w: Optional[float]
     last_cycle_avg_w: Optional[float]
-    standby_power_w: Optional[float]
+    energy_residual_kwh: Optional[float]
+    residual_sigma: Optional[float]
 
     def as_dict(self) -> Dict[str, object]:
-        """Return dict for coordinator consumers."""
         return asdict(self)
 
 
 class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
-    """Coordinator that evaluates appliance health."""
+    """Coordinator that performs analytics, storage, and health evaluation."""
 
     def __init__(self, hass: HomeAssistant, entry) -> None:
         self.hass = hass
         self.entry = entry
         self._power_entity = entry.data[CONF_POWER_SENSOR]
-        self._energy_entity = entry.data[CONF_ENERGY_SENSOR]
-        self._power_history: Deque[Tuple[datetime, float]] = deque(maxlen=MAX_HISTORY_MINUTES)
-        self._energy_history: Deque[Tuple[datetime, float]] = deque(maxlen=MAX_HISTORY_MINUTES)
-        self._cycle_tracker = CycleTracker()
-        self._ewma_daily: Optional[float] = None
-        self._energy_residual: Optional[float] = None
+        self._energy_entity = entry.data.get(CONF_ENERGY_SENSOR)
+        self._ambient_sensor = entry.data.get(CONF_AMBIENT_SENSOR)
+        self._weather_entity = entry.data.get(CONF_WEATHER_ENTITY)
+
+        self._power_history: Deque[tuple[datetime, float]] = deque(maxlen=MAX_HISTORY_MINUTES)
+        self._energy_history: Deque[tuple[datetime, float]] = deque(maxlen=MAX_HISTORY_MINUTES)
+        self._cycle_detector = CycleDetector()
+        self._baseline = BaselineModel()
+        self._ambient_model = AmbientModel()
+        self._health = HealthEvaluator()
+        self._storage = ApplianceShieldStorage(hass, entry.entry_id)
+        self._storage_loaded = False
+        self._pending_save = False
         self._residual_stats = RunningStats()
-        self._residual_sigma: Optional[float] = None
+        self._energy_residual_kwh: Optional[float] = None
+        self._last_logged_day: Optional[str] = None
+        self._last_cycle_summary: Optional[CycleSummary] = None
 
         update_interval = entry.options.get("scan_interval") if entry.options else None
         super().__init__(
@@ -330,8 +146,29 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
             else DEFAULT_SCAN_INTERVAL,
         )
 
+    async def async_reset_baseline(self) -> None:
+        self._baseline.reset()
+        self._ambient_model = AmbientModel()
+        self._residual_stats = RunningStats()
+        self._energy_residual_kwh = None
+        self._last_logged_day = None
+        self._pending_save = True
+        await self._storage.async_save(self._serialize_state())
+        await self.async_request_refresh()
+
+    async def _ensure_storage_loaded(self) -> None:
+        if self._storage_loaded:
+            return
+        data = await self._storage.async_load()
+        self._baseline.load(data.get("baseline"))
+        self._ambient_model.load(data.get("ambient"))
+        self._residual_stats.load(data.get("residual_stats"))
+        self._last_logged_day = data.get("last_logged_day")
+        self._energy_residual_kwh = data.get("last_residual")
+        self._storage_loaded = True
+
     async def _async_update_data(self) -> ApplianceDiagnostics:
-        """Fetch latest HA states and derive analytics."""
+        await self._ensure_storage_loaded()
         now = dt_util.utcnow()
         power = self._state_to_float(self._power_entity)
         energy = self._state_to_float(self._energy_entity)
@@ -339,75 +176,97 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         if power is None and energy is None:
             raise UpdateFailed("Neither power nor energy sensor is reporting numeric data")
 
-        cycle_snapshot = self._cycle_tracker.update(now, power)
+        ambient_temp = self._ambient_temperature()
+        cycle_state = self._cycle_detector.update(now, power)
+        if cycle_state.cycle_summary:
+            self._baseline.update_cycle(
+                cycle_state.cycle_summary.on_minutes,
+                cycle_state.cycle_summary.off_minutes,
+                cycle_state.cycle_summary.energy_kwh,
+            )
+            self._last_cycle_summary = cycle_state.cycle_summary
+            self._pending_save = True
 
-        if power is not None:
-            self._power_history.append((now, power))
-        if energy is not None:
-            if self._energy_history and energy < self._energy_history[-1][1]:
-                # Counter reset, discard stale samples.
-                self._energy_history.clear()
-            self._energy_history.append((now, energy))
-
-        self._prune_history(now)
-
+        self._update_histories(now, power, energy)
         daily_energy = self._estimate_daily_energy()
         runtime_ratio = self._estimate_runtime_ratio()
-        self._update_energy_baseline(daily_energy)
-        metadata = self._metadata()
-        expected_daily = self._expected_daily_kwh(metadata)
-        reference_annual = (
-            metadata.get(CONF_TARGET_ANNUAL_KWH)
-            if metadata.get(CONF_TARGET_ANNUAL_KWH)
-            else (expected_daily * 365 if expected_daily is not None else None)
-        )
-        observed_annual = daily_energy * 365 if daily_energy is not None else None
-        eei = self._compute_eei(observed_annual, reference_annual)
-        primary_score = self._score_from_index(eei, ENERGY_SCORE_PRIMARY)
-        extended_score = self._score_from_index(eei, ENERGY_SCORE_EXTENDED)
+        self._update_daily_models(now, daily_energy, ambient_temp)
 
-        issues = self._evaluate_issues(
-            power,
-            daily_energy,
-            runtime_ratio,
-            expected_daily,
-            cycle_snapshot,
+        metadata = self._metadata()
+        correction = self._ambient_model.correction_factor(ambient_temp)
+        eei_result = compute_eei(daily_energy, metadata, correction)
+        normalized_daily = eei_result.normalized_daily_kwh or daily_energy
+        observed_annual = normalized_daily * 365 if normalized_daily is not None else None
+        reference_annual = (
+            eei_result.reference_daily_kwh * 365 if eei_result.reference_daily_kwh else None
         )
-        health_state = self._derive_health_state(issues, daily_energy)
+
+        residual_sigma = self._residual_stats.std
+        residual_z = None
+        if self._energy_residual_kwh is not None and residual_sigma not in (None, 0.0):
+            residual_z = self._energy_residual_kwh / residual_sigma
+
+        issues = self._evaluate_issues(power, daily_energy, runtime_ratio)
+        health_result = self._health.evaluate(
+            issues,
+            self._baseline,
+            self._last_cycle_summary,
+            runtime_ratio,
+            residual_z,
+            cycle_state.compressor_running,
+        )
 
         sample_window_hours = self._sample_window_hours()
         last_sample = self._power_history[-1][0] if self._power_history else now
 
         diagnostics = ApplianceDiagnostics(
-            health_state=health_state,
-            issues=issues,
+            health_state=health_result.state,
+            health_score=health_result.score,
+            issues=health_result.issues,
             instantaneous_power_w=power,
+            ambient_temp_c=ambient_temp,
             daily_energy_kwh=daily_energy,
+            normalized_daily_kwh=eei_result.normalized_daily_kwh,
+            ewma_daily_kwh=self._baseline.daily_energy_ewma,
             runtime_ratio=runtime_ratio,
             observed_annual_kwh=observed_annual,
-            expected_daily_kwh=expected_daily,
+            expected_daily_kwh=eei_result.reference_daily_kwh,
             reference_annual_kwh=reference_annual,
-            energy_efficiency_index=eei,
-            primary_score=primary_score,
-            extended_score=extended_score,
+            energy_efficiency_index=eei_result.eei,
+            primary_score=eei_result.primary_class,
+            extended_score=eei_result.extended_class,
             sample_window_hours=sample_window_hours,
             last_sample_utc=last_sample.isoformat(),
             metadata=metadata,
-            cycle_state=cycle_snapshot.state,
-            idle_hours=cycle_snapshot.idle_hours,
-            ewma_daily_kwh=self._ewma_daily,
-            energy_residual_kwh=self._energy_residual,
-            residual_sigma=self._residual_sigma,
-            signature_ready=cycle_snapshot.signature_ready,
-            feature_stats=cycle_snapshot.feature_stats,
-            last_cycle_minutes=cycle_snapshot.last_on_minutes,
-            last_cycle_peak_w=cycle_snapshot.last_peak_power_w,
-            last_cycle_avg_w=cycle_snapshot.last_avg_power_w,
-            standby_power_w=cycle_snapshot.standby_mean_w,
+            compressor_running=health_result.compressor_running,
+            door_open=health_result.door_open,
+            confidence=self._baseline.confidence(),
+            idle_hours=cycle_state.idle_hours,
+            last_cycle_minutes=(self._last_cycle_summary.on_minutes if self._last_cycle_summary else None),
+            last_cycle_peak_w=(self._last_cycle_summary.peak_power_w if self._last_cycle_summary else None),
+            last_cycle_avg_w=(self._last_cycle_summary.avg_power_w if self._last_cycle_summary else None),
+            energy_residual_kwh=self._energy_residual_kwh,
+            residual_sigma=round(residual_sigma, 3) if residual_sigma else None,
         )
+
+        if self._pending_save:
+            await self._storage.async_save(self._serialize_state())
+            self._pending_save = False
+
         return diagnostics
 
-    def _state_to_float(self, entity_id: str) -> Optional[float]:
+    def _serialize_state(self) -> Dict[str, object]:
+        return {
+            "baseline": self._baseline.as_dict(),
+            "ambient": self._ambient_model.as_dict(),
+            "residual_stats": self._residual_stats.as_dict(),
+            "last_logged_day": self._last_logged_day,
+            "last_residual": self._energy_residual_kwh,
+        }
+
+    def _state_to_float(self, entity_id: Optional[str]) -> Optional[float]:
+        if not entity_id:
+            return None
         state = self.hass.states.get(entity_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return None
@@ -417,7 +276,27 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
             _LOGGER.debug("Non-numeric state for %s: %s", entity_id, state.state)
             return None
 
-    def _prune_history(self, now: datetime) -> None:
+    def _ambient_temperature(self) -> Optional[float]:
+        if self._ambient_sensor:
+            temp = self._state_to_float(self._ambient_sensor)
+            if temp is not None:
+                return temp
+        if self._weather_entity:
+            weather = self.hass.states.get(self._weather_entity)
+            if weather and (temp := weather.attributes.get("temperature")) is not None:
+                try:
+                    return float(temp)
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    def _update_histories(self, now: datetime, power: Optional[float], energy: Optional[float]) -> None:
+        if power is not None:
+            self._power_history.append((now, power))
+        if energy is not None:
+            if self._energy_history and energy < self._energy_history[-1][1]:
+                self._energy_history.clear()
+            self._energy_history.append((now, energy))
         cutoff = now - timedelta(minutes=MAX_HISTORY_MINUTES)
         while self._power_history and self._power_history[0][0] < cutoff:
             self._power_history.popleft()
@@ -425,17 +304,50 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
             self._energy_history.popleft()
 
     def _estimate_daily_energy(self) -> Optional[float]:
+        daily = self._estimate_daily_energy_from_cumulative()
+        if daily is not None:
+            return daily
+        return self._estimate_daily_energy_from_power()
+
+    def _estimate_daily_energy_from_cumulative(self) -> Optional[float]:
         if len(self._energy_history) < 2:
             return None
         oldest_time, oldest_value = self._energy_history[0]
         newest_time, newest_value = self._energy_history[-1]
         elapsed_hours = (newest_time - oldest_time).total_seconds() / 3600
-        if elapsed_hours < 1:
+        if elapsed_hours < 6:
             return None
         delta = newest_value - oldest_value
         if delta <= 0:
             return None
         daily = delta / elapsed_hours * 24
+        return round(daily, 3)
+
+    def _estimate_daily_energy_from_power(self) -> Optional[float]:
+        if len(self._power_history) < 2:
+            return None
+        oldest_time = self._power_history[0][0]
+        newest_time = self._power_history[-1][0]
+        coverage_hours = (newest_time - oldest_time).total_seconds() / 3600
+        if coverage_hours < 6:
+            return None
+        samples = list(self._power_history)
+        prev_time, prev_power = samples[0]
+        energy_kwh = 0.0
+        for timestamp, power in samples[1:]:
+            delta_hours = (timestamp - prev_time).total_seconds() / 3600
+            if delta_hours <= 0:
+                prev_time, prev_power = timestamp, power
+                continue
+            if delta_hours > 1.0:
+                prev_time, prev_power = timestamp, power
+                continue
+            avg_kw = ((prev_power + power) / 2.0) / 1000.0
+            energy_kwh += avg_kw * delta_hours
+            prev_time, prev_power = timestamp, power
+        if energy_kwh <= 0 or coverage_hours <= 0:
+            return None
+        daily = energy_kwh / coverage_hours * 24
         return round(daily, 3)
 
     def _estimate_runtime_ratio(self) -> Optional[float]:
@@ -445,23 +357,26 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         ratio = running_samples / len(self._power_history)
         return round(min(max(ratio, 0.0), 1.0), 3)
 
-    def _update_energy_baseline(self, daily_energy: Optional[float]) -> None:
+    def _update_daily_models(
+        self,
+        now: datetime,
+        daily_energy: Optional[float],
+        ambient_temp: Optional[float],
+    ) -> None:
         if daily_energy is None:
             return
-        if self._ewma_daily is None:
-            self._ewma_daily = round(daily_energy, 3)
-            self._energy_residual = 0.0
-            self._residual_sigma = None
+        day_key = now.date().isoformat()
+        if self._last_logged_day == day_key:
             return
-
-        residual = daily_energy - self._ewma_daily
-        self._energy_residual = round(residual, 3)
-        self._residual_stats.update(residual)
-        sigma = self._residual_stats.std
-        self._residual_sigma = round(sigma, 3) if sigma is not None else None
-
-        updated_baseline = EWMA_ALPHA * daily_energy + (1 - EWMA_ALPHA) * self._ewma_daily
-        self._ewma_daily = round(updated_baseline, 3)
+        self._baseline.update_daily_energy(day_key, daily_energy)
+        if ambient_temp is not None:
+            self._ambient_model.update(ambient_temp, daily_energy)
+        if self._baseline.daily_energy_ewma is not None:
+            residual = daily_energy - self._baseline.daily_energy_ewma
+            self._energy_residual_kwh = round(residual, 3)
+            self._residual_stats.update(residual)
+        self._last_logged_day = day_key
+        self._pending_save = True
 
     def _metadata(self) -> Dict[str, Optional[float | str]]:
         data = self.entry.data
@@ -474,47 +389,15 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
             CONF_TARGET_ANNUAL_KWH: data.get(CONF_TARGET_ANNUAL_KWH),
             CONF_POWER_SENSOR: data.get(CONF_POWER_SENSOR),
             CONF_ENERGY_SENSOR: data.get(CONF_ENERGY_SENSOR),
+            CONF_AMBIENT_SENSOR: data.get(CONF_AMBIENT_SENSOR),
+            CONF_WEATHER_ENTITY: data.get(CONF_WEATHER_ENTITY),
         }
-
-    def _expected_daily_kwh(self, metadata: Dict[str, Optional[float | str]]) -> Optional[float]:
-        appliance_type = metadata.get(CONF_APPLIANCE_TYPE)
-        if appliance_type not in DEFAULT_REFERENCE_TABLE:
-            return None
-        table = DEFAULT_REFERENCE_TABLE[appliance_type]
-        volume = metadata.get(CONF_VOLUME_LITERS) or 0.0
-        freezer_volume = metadata.get(CONF_FREEZER_VOLUME_LITERS) or 0.0
-        climate_multiplier = CLIMATE_CLASS_MULTIPLIERS.get(metadata.get(CONF_CLIMATE_CLASS, "N"), 1.0)
-
-        effective_volume = volume
-        if appliance_type == "fridge_freezer":
-            effective_volume += 0.8 * freezer_volume
-        elif appliance_type == "freezer":
-            effective_volume = max(volume, freezer_volume)
-
-        reference_annual = (table["base"] + table["per_liter"] * effective_volume) * climate_multiplier
-        return round(reference_annual / 365, 3)
-
-    def _compute_eei(self, observed_annual: Optional[float], reference_annual: Optional[float]) -> Optional[float]:
-        if not observed_annual or not reference_annual:
-            return None
-        eei = observed_annual / reference_annual
-        return round(eei, 3)
-
-    def _score_from_index(self, eei: Optional[float], ladder: Tuple[Tuple[str, float], ...]) -> Optional[str]:
-        if eei is None:
-            return None
-        for label, threshold in ladder:
-            if eei <= threshold:
-                return label
-        return ladder[-1][0]
 
     def _evaluate_issues(
         self,
         instantaneous_power: Optional[float],
         daily_energy: Optional[float],
         runtime_ratio: Optional[float],
-        expected_daily: Optional[float],
-        cycle_snapshot: CycleSnapshot,
     ) -> List[str]:
         issues: List[str] = []
         if instantaneous_power is None:
@@ -524,90 +407,31 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
 
         if daily_energy is None:
             issues.append("insufficient_energy_window")
-        elif expected_daily:
-            deviation = (daily_energy - expected_daily) / expected_daily
-            if deviation >= 0.7:
-                issues.append("energy_far_above_baseline")
-            elif deviation <= -0.5:
-                issues.append("energy_far_below_baseline")
-            elif abs(deviation) >= 0.35:
-                issues.append("energy_out_of_range")
+        else:
+            expected = self._baseline.daily_energy_ewma
+            if expected:
+                deviation = (daily_energy - expected) / expected
+                if deviation >= 0.7:
+                    issues.append("energy_far_above_baseline")
+                elif deviation <= -0.5:
+                    issues.append("energy_far_below_baseline")
+                elif abs(deviation) >= 0.35:
+                    issues.append("energy_out_of_range")
 
         if runtime_ratio is None:
             issues.append("insufficient_runtime_samples")
-        else:
-            if runtime_ratio <= 0.1:
-                issues.append("runtime_too_low")
-            elif runtime_ratio >= 0.8:
-                issues.append("runtime_too_high")
-
-        if cycle_snapshot.signature_ready:
-            if cycle_snapshot.state == "short_cycle":
-                issues.append("cycle_short_detected")
-            elif cycle_snapshot.state == "long_cycle":
-                issues.append("cycle_long_detected")
-            elif cycle_snapshot.state == "stalled_cycle":
-                issues.append("cycle_stalled_detected")
-            elif cycle_snapshot.state == "idle":
-                issues.append("cycle_idle_timeout")
-
-        if cycle_snapshot.standby_mean_w is not None and cycle_snapshot.standby_mean_w >= STANDBY_HIGH_W:
-            issues.append("standby_power_high")
-
-        if (
-            self._energy_residual is not None
-            and self._residual_sigma not in (None, 0.0)
-            and self._residual_stats.count >= MIN_RESIDUAL_SAMPLES
-        ):
-            residual_indicator = "energy_residual_high" if self._energy_residual > 0 else "energy_residual_low"
-            z_score = self._energy_residual / self._residual_sigma
-            if abs(z_score) >= RESIDUAL_SIGMA_CRITICAL:
-                issues.append("energy_residual_extreme")
-                issues.append(residual_indicator)
-            elif abs(z_score) >= RESIDUAL_SIGMA_ATTENTION:
-                issues.append("energy_residual_anomaly")
-                issues.append(residual_indicator)
 
         return issues
 
-    def _derive_health_state(self, issues: List[str], daily_energy: Optional[float]) -> str:
-        if not self._energy_history or self._sample_window_hours() < 4:
-            return HEALTH_STATE_INITIALIZING
-
-        critical_tokens = {
-            "compressor_power_spike",
-            "energy_far_above_baseline",
-            "cycle_stalled_detected",
-            "cycle_idle_timeout",
-            "energy_residual_extreme",
-        }
-        if any(token in issues for token in critical_tokens):
-            return HEALTH_STATE_CRITICAL
-
-        attention_tokens = {
-            "energy_out_of_range",
-            "energy_far_below_baseline",
-            "runtime_too_low",
-            "runtime_too_high",
-            "cycle_short_detected",
-            "cycle_long_detected",
-            "standby_power_high",
-            "energy_residual_anomaly",
-            "energy_residual_high",
-            "energy_residual_low",
-        }
-        if any(token in issues for token in attention_tokens):
-            return HEALTH_STATE_ATTENTION
-
-        if daily_energy is None:
-            return HEALTH_STATE_ATTENTION
-
-        return HEALTH_STATE_HEALTHY
-
     def _sample_window_hours(self) -> float:
-        if len(self._energy_history) < 2:
+        history: Deque[tuple[datetime, float]]
+        if len(self._energy_history) >= 2:
+            history = self._energy_history
+        elif len(self._power_history) >= 2:
+            history = self._power_history
+        else:
             return 0.0
-        oldest = self._energy_history[0][0]
-        newest = self._energy_history[-1][0]
+        oldest = history[0][0]
+        newest = history[-1][0]
         hours = (newest - oldest).total_seconds() / 3600
         return round(hours, 2)

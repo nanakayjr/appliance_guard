@@ -1,7 +1,7 @@
 {
   "domain": "appliance_shield",
   "name": "Appliance Shield",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "documentation": "https://github.com/example/appliance_shield",
   "issue_tracker": "https://github.com/example/appliance_shield/issues",
   "requirements": [],

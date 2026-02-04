@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.typing import ConfigType
+import voluptuous as vol
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN, PLATFORMS, SERVICE_RESET_BASELINE
 from .coordinator import ApplianceShieldCoordinator
 
 ConfigEntryType = ConfigEntry
@@ -25,7 +26,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntryType) -> bool
 
     await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RESET_BASELINE):
+        async def _handle(call: ServiceCall) -> None:
+            await _async_handle_reset_service(hass, call)
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RESET_BASELINE,
+            _handle,
+            schema=vol.Schema({vol.Optional("entry_id"): str}),
+        )
     return True
+
+
+async def _async_handle_reset_service(hass: HomeAssistant, call: ServiceCall) -> None:
+    entry_id = call.data.get("entry_id")
+    targets = (
+        [entry_id]
+        if entry_id
+        else list(hass.data.get(DOMAIN, {}).keys())
+    )
+    for target in targets:
+        coordinator: ApplianceShieldCoordinator | None = hass.data[DOMAIN].get(target)
+        if coordinator:
+            await coordinator.async_reset_baseline()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntryType) -> bool:

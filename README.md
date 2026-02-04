@@ -8,7 +8,7 @@ A Home Assistant (Hass.io) custom integration that watches high-consumption appl
 
 ## Features
 
-- Works with any existing `sensor` entities that expose instantaneous power (W) and accumulated energy (kWh).
+- Works with any existing `sensor` entities that expose instantaneous power (W) and optionally accumulated energy (kWh); if you only provide Watts, Appliance Shield integrates the samples to keep daily EEI math compliant.
 - Config flow that captures appliance type, volume, efficiency targets, and telemetry entity IDs.
 - Coordinator-driven sensors with bounded deques (≤24h history) to keep RAM usage predictable (<50 kB per appliance).
 - Fully async implementation, no polling threads, and minimal database hits (no Recorder queries by default).
@@ -31,7 +31,7 @@ A Home Assistant (Hass.io) custom integration that watches high-consumption appl
 | Climate class | Impacts reference baselines (SN/N/ST/T). |
 | Target annual energy (kWh) | Optional manufacturer label if you have it. |
 | Power sensor | Entity supplying instantaneous watts. |
-| Energy sensor | Entity supplying cumulative kWh. |
+| Energy sensor | (Optional) Entity supplying cumulative kWh to increase accuracy; power-only setups are supported. |
 
 You can re-open the flow later to adjust metadata or swap telemetry sources.
 
@@ -42,14 +42,15 @@ You can re-open the flow later to adjust metadata or swap telemetry sources.
 | `sensor.<name>_appliance_health` | Enum sensor with states: `initializing`, `healthy`, `attention`, `critical`. Attributes include runtime ratio, detected issues, sample window, and timestamps. |
 | `sensor.<name>_energy_score` | Enum (A–D) with attributes for calculated EEI, extended EU band (A–G), expected vs observed annual kWh, and user-supplied metadata. |
 | `sensor.<name>_energy_index` | Numeric EEI (unitless) for automations or dashboards. |
+| `binary_sensor.<name>_compressor_running` | Exposes the live compressor state and recent runtime statistics. |
+| `binary_sensor.<name>_door_open` | Indicates when the heuristics infer a stuck door / seal problem, plus supporting evidence. |
 
-## Health & Scoring Logic (v0.2)
+## Health & Scoring Logic (v0.3)
 
-- **Daily energy with EWMA baseline**: 24 h deltas still drive consumption, but an exponentially weighted moving average (α = 0.1) now tracks the appliance-specific baseline so residuals highlight sudden jumps or drops. Z-score thresholds (3σ attention, 5σ critical) gate alerts.
-- **Compressor signature modeling**: Each update feeds a cycle tracker that records on/off durations, average/peak running power, and standby draw via bounded online statistics. After a short learning period (~12 cycles) the tracker classifies `normal`, `short_cycle`, `long_cycle`, `stalled_cycle`, or `idle` behavior.
-- **State machine faulting**: Idle time-outs (>4× period or ≥2 h), low peak power (<40 W), and persistent rapid cycling escalate directly to the `critical` or `attention` buckets. Standby draw above 15 W also raises efficiency concerns.
-- **Runtime ratio + instantaneous checks**: Legacy heuristics (runtime band, >350 W spikes, missing telemetry) remain as supporting evidence, ensuring backwards-compatible coverage while the richer model calibrates.
-- **Energy score**: Still derived from the EU EEI formula (`EEI = observed_annual / reference_annual`) with A–D surface states and full A–G band plus raw EEI exposed through attributes.
+- **Ambient-normalized daily energy**: Every 24 h Appliance Shield computes the measured kWh/day (integrating power when no cumulative sensor exists) and applies an online linear regression so EEI maps to the official reference temperature. The normalized daily energy, EWMA baseline, and confidence surface as attributes for audits.
+- **EU EEI compliance**: Reference consumption follows the delegated regulation lookup (type, volumes, climate class) and applies user-provided manufacturer targets when present. Ambient-corrected energy feeds the primary (A–D) sensor state, while the extended ladder (A–G) and raw EEI are exposed as attributes.
+- **Cycle-informed health checks**: The hysteresis cycle detector contributes Ton/Toff, peak/average watts, idle hours, and runtime ratio into the health score. EWMA residuals, Z-scores, and rule-based door/open inference feed the binary sensors plus a 0–100 health score.
+- **Persistent baselines & resets**: Rolling histories, EWMA statistics, and residual sigma are persisted via `storage` so restarts don’t reset confidence. A built-in `appliance_shield.reset_baseline` service clears models if the user services the appliance.
 
 ## Performance & Compliance Notes
 

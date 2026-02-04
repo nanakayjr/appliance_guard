@@ -56,7 +56,7 @@ class ApplianceShieldConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_POWER_SENSOR): selector.selector(
                         {"entity": {"domain": "sensor", "device_class": "power"}}
                     ),
-                    vol.Required(CONF_ENERGY_SENSOR): selector.selector(
+                    vol.Optional(CONF_ENERGY_SENSOR): selector.selector(
                         {"entity": {"domain": "sensor", "device_class": "energy"}}
                     ),
                 }

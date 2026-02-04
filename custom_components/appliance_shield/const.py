@@ -6,8 +6,9 @@ from datetime import timedelta
 from homeassistant.const import Platform
 
 DOMAIN = "appliance_shield"
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
 DATA_COORDINATOR = "coordinator"
+SERVICE_RESET_BASELINE = "reset_baseline"
 
 CONF_APPLIANCE_TYPE = "appliance_type"
 CONF_VOLUME_LITERS = "volume_liters"
@@ -16,6 +17,8 @@ CONF_CLIMATE_CLASS = "climate_class"
 CONF_TARGET_ANNUAL_KWH = "target_annual_kwh"
 CONF_POWER_SENSOR = "power_entity_id"
 CONF_ENERGY_SENSOR = "energy_entity_id"
+CONF_AMBIENT_SENSOR = "ambient_sensor_id"
+CONF_WEATHER_ENTITY = "weather_entity_id"
 
 APPLIANCE_TYPES = ["fridge", "freezer", "fridge_freezer"]
 CLIMATE_CLASSES = ["SN", "N", "ST", "T"]
@@ -35,6 +38,12 @@ EWMA_ALPHA = 0.1
 RESIDUAL_SIGMA_ATTENTION = 3.0
 RESIDUAL_SIGMA_CRITICAL = 5.0
 MIN_RESIDUAL_SAMPLES = 10
+PERCENTILE_WINDOW = 480
+MIN_BURN_IN_DAYS = 2
+DEFAULT_BURN_IN_DAYS = 7
+DEFAULT_STORAGE_VERSION = 1
+DEFAULT_REFERENCE_TEMP_C = 25.0
+DAILY_HISTORY_DAYS = 90
 
 HEALTH_STATE_INITIALIZING = "initializing"
 HEALTH_STATE_HEALTHY = "healthy"
@@ -78,6 +87,7 @@ ATTR_RUNTIME_RATIO = "runtime_ratio"
 ATTR_SAMPLE_WINDOW_HOURS = "sample_window_hours"
 ATTR_LAST_SAMPLE = "last_sample_utc"
 ATTR_EXPECTED_DAILY_KWH = "expected_daily_kwh"
+ATTR_NORMALIZED_DAILY_KWH = "normalized_daily_kwh"
 ATTR_OBSERVED_ANNUAL_KWH = "observed_annual_kwh"
 ATTR_REFERENCE_ANNUAL_KWH = "reference_annual_kwh"
 ATTR_EEI = "energy_efficiency_index"
@@ -95,3 +105,11 @@ ATTR_STANDBY_POWER_W = "standby_power_w"
 ATTR_EWMA_DAILY_KWH = "ewma_daily_energy_kwh"
 ATTR_ENERGY_RESIDUAL_KWH = "energy_residual_kwh"
 ATTR_RESIDUAL_SIGMA = "energy_residual_sigma"
+ATTR_HEALTH_SCORE = "health_score"
+ATTR_CONFIDENCE = "classification_confidence"
+ATTR_COMPRESSOR_RUNNING = "compressor_running"
+ATTR_DOOR_OPEN = "door_open"
+ATTR_DUTY_CYCLE = "duty_cycle_ratio"
+ATTR_TON_MINUTES = "ton_minutes"
+ATTR_TOFF_MINUTES = "toff_minutes"
+ATTR_CYCLE_ENERGY = "cycle_energy_kwh"
