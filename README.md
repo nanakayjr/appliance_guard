@@ -63,7 +63,7 @@ You can re-open the flow later to adjust metadata or swap telemetry sources.
 
 ## Next Steps
 
-- Extend heuristics for other appliance categories (washers, dryers) while reusing the scoring helpers.
+- Extend heuristics for other appliance categories (washers, dryers, air/conditioners) while reusing the scoring helpers.
 - Add optional Recorder-powered statistics for higher precision when the database is enabled.
 - Surface repair suggestions through the Repairs UI (future HA release requirement).
 
