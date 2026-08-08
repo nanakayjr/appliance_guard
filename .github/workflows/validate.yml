@@ -25,3 +25,7 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # No brand assets are submitted to home-assistant/brands and this
+          # repository isn't seeking default-store inclusion, so the brands
+          # check (only relevant for that) is ignored here.
+          ignore: brands

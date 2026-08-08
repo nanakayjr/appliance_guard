@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 import voluptuous as vol
 
@@ -11,6 +12,10 @@ from .const import DOMAIN, PLATFORMS, SERVICE_RESET_BASELINE
 from .coordinator import ApplianceShieldCoordinator
 
 ConfigEntryType = ConfigEntry
+
+# Appliance Shield can only be configured through the UI config flow; this
+# tells hassfest/HA there is no YAML configuration schema to validate.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:

@@ -1,0 +1,19 @@
+reset_baseline:
+  name: Reset baseline
+  description: >-
+    Clears the learned baseline (cycle statistics, daily energy EWMA, ambient
+    regression, and residual sigma) for one or all Appliance Shield entries.
+    Use this after servicing an appliance (e.g. replacing a door seal or
+    recharging refrigerant) so the health and energy scoring models relearn
+    from a clean state instead of comparing against stale pre-repair data.
+  fields:
+    entry_id:
+      name: Config entry
+      description: >-
+        The Appliance Shield config entry to reset. If omitted, the baseline
+        is reset for every configured appliance.
+      required: false
+      example: "01hxyz0123456789abcdefghi"
+      selector:
+        config_entry:
+          integration: appliance_shield
