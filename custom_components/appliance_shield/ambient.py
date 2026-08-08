@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 
-from .const import DEFAULT_REFERENCE_TEMP_C
+from .const import (
+    AMBIENT_CORRECTION_MAX,
+    AMBIENT_CORRECTION_MIN,
+    AMBIENT_MIN_SAMPLES_FOR_SLOPE,
+    DEFAULT_REFERENCE_TEMP_C,
+)
 
 
 @dataclass
@@ -43,7 +48,12 @@ class AmbientModel:
         self.last_energy = daily_energy_kwh
 
     def _coefficients(self) -> tuple[float, float]:
-        if self.count < 3:
+        # Require a minimum sample count before trusting a fitted slope; with
+        # only a handful of noisy daily points the regression is ill
+        # conditioned and can wildly extrapolate for temperatures outside the
+        # observed range. Fall back to a flat (slope=0) model until enough
+        # data has been collected.
+        if self.count < AMBIENT_MIN_SAMPLES_FOR_SLOPE:
             intercept = (self.sum_y / self.count) if self.count else (self.last_energy or 0.0)
             return (0.0, intercept)
         denom = (self.count * self.sum_tt) - (self.sum_t ** 2)
@@ -62,7 +72,11 @@ class AmbientModel:
         reference = intercept + slope * self.reference_temp
         if expected <= 0 or reference <= 0:
             return 1.0
-        return reference / expected
+        factor = reference / expected
+        # Clamp: a handful of noisy days should never be able to swing the
+        # normalized energy (and therefore the energy class) by more than
+        # this band. Protects against ill-conditioned/extrapolated fits.
+        return round(min(max(factor, AMBIENT_CORRECTION_MIN), AMBIENT_CORRECTION_MAX), 4)
 
     def as_dict(self) -> Dict[str, float | int]:
         slope, intercept = self._coefficients()

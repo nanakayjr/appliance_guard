@@ -30,7 +30,9 @@ from .const import (
     DOMAIN,
     MAX_HISTORY_MINUTES,
     POWER_RUNNING_THRESHOLD_W,
+    POWER_SPIKE_PERSIST_SAMPLES,
     POWER_SPIKE_THRESHOLD_W,
+    POWER_UNAVAILABLE_PERSIST_SAMPLES,
 )
 from .eei import compute_eei
 from .health import HealthEvaluator, HealthResult
@@ -135,6 +137,10 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         self._energy_residual_kwh: Optional[float] = None
         self._last_logged_day: Optional[str] = None
         self._last_cycle_summary: Optional[CycleSummary] = None
+        # Debounce counters so a single noisy sample can't flip the health
+        # state; a fault must persist across consecutive refreshes.
+        self._power_spike_streak = 0
+        self._power_unavailable_streak = 0
 
         update_interval = entry.options.get("scan_interval") if entry.options else None
         super().__init__(
@@ -152,6 +158,8 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         self._residual_stats = RunningStats()
         self._energy_residual_kwh = None
         self._last_logged_day = None
+        self._power_spike_streak = 0
+        self._power_unavailable_streak = 0
         self._pending_save = True
         await self._storage.async_save(self._serialize_state())
         await self.async_request_refresh()
@@ -177,21 +185,21 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
             raise UpdateFailed("Neither power nor energy sensor is reporting numeric data")
 
         ambient_temp = self._ambient_temperature()
+        # Advance the compressor state machine, but defer folding this
+        # cycle's numbers into the learned baseline until *after* we've
+        # compared it against that baseline below (predict-then-update).
+        # Updating the baseline first would let a cycle's own value dilute
+        # the very deviation we're trying to detect.
         cycle_state = self._cycle_detector.update(now, power)
-        if cycle_state.cycle_summary:
-            self._baseline.update_cycle(
-                cycle_state.cycle_summary.on_minutes,
-                cycle_state.cycle_summary.off_minutes,
-                cycle_state.cycle_summary.energy_kwh,
-            )
-            self._last_cycle_summary = cycle_state.cycle_summary
-            self._pending_save = True
+        cycle_summary_for_eval = cycle_state.cycle_summary or self._last_cycle_summary
 
         self._update_histories(now, power, energy)
         daily_energy = self._estimate_daily_energy()
         runtime_ratio = self._estimate_runtime_ratio()
-        self._update_daily_models(now, daily_energy, ambient_temp)
 
+        # EEI/ambient correction is likewise computed against the ambient
+        # model *before* today's sample is absorbed (see _update_daily_models
+        # below), keeping the reported class stable from run to run.
         metadata = self._metadata()
         correction = self._ambient_model.correction_factor(ambient_temp)
         eei_result = compute_eei(daily_energy, metadata, correction)
@@ -210,11 +218,23 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         health_result = self._health.evaluate(
             issues,
             self._baseline,
-            self._last_cycle_summary,
+            cycle_summary_for_eval,
             runtime_ratio,
             residual_z,
             cycle_state.compressor_running,
         )
+
+        # Posterior updates: now that this cycle/day has been evaluated
+        # against the prior baseline, fold it in for next time.
+        if cycle_state.cycle_summary:
+            self._baseline.update_cycle(
+                cycle_state.cycle_summary.on_minutes,
+                cycle_state.cycle_summary.off_minutes,
+                cycle_state.cycle_summary.energy_kwh,
+            )
+            self._last_cycle_summary = cycle_state.cycle_summary
+            self._pending_save = True
+        self._update_daily_models(now, daily_energy, ambient_temp, runtime_ratio)
 
         sample_window_hours = self._sample_window_hours()
         last_sample = self._power_history[-1][0] if self._power_history else now
@@ -362,19 +382,26 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
         now: datetime,
         daily_energy: Optional[float],
         ambient_temp: Optional[float],
+        runtime_ratio: Optional[float] = None,
     ) -> None:
         if daily_energy is None:
             return
         day_key = now.date().isoformat()
         if self._last_logged_day == day_key:
             return
-        self._baseline.update_daily_energy(day_key, daily_energy)
-        if ambient_temp is not None:
-            self._ambient_model.update(ambient_temp, daily_energy)
-        if self._baseline.daily_energy_ewma is not None:
-            residual = daily_energy - self._baseline.daily_energy_ewma
+        # Predict-then-update: capture the prior baseline and compare today's
+        # observation against *that* before letting it influence the EWMA.
+        # Comparing against the post-update value would let every sample
+        # partially explain away its own deviation, muting anomaly detection.
+        prior_ewma = self._baseline.daily_energy_ewma
+        if prior_ewma is not None:
+            residual = daily_energy - prior_ewma
             self._energy_residual_kwh = round(residual, 3)
             self._residual_stats.update(residual)
+        self._baseline.update_daily_energy(day_key, daily_energy)
+        self._baseline.update_daily_runtime_ratio(runtime_ratio)
+        if ambient_temp is not None:
+            self._ambient_model.update(ambient_temp, daily_energy)
         self._last_logged_day = day_key
         self._pending_save = True
 
@@ -401,9 +428,22 @@ class ApplianceShieldCoordinator(DataUpdateCoordinator[ApplianceDiagnostics]):
     ) -> List[str]:
         issues: List[str] = []
         if instantaneous_power is None:
+            self._power_unavailable_streak += 1
+            self._power_spike_streak = 0
             issues.append("power_sensor_unavailable")
-        elif instantaneous_power >= POWER_SPIKE_THRESHOLD_W:
-            issues.append("compressor_power_spike")
+            if self._power_unavailable_streak >= POWER_UNAVAILABLE_PERSIST_SAMPLES:
+                issues.append("power_sensor_unavailable_persistent")
+        else:
+            self._power_unavailable_streak = 0
+            if instantaneous_power >= POWER_SPIKE_THRESHOLD_W:
+                self._power_spike_streak += 1
+                issues.append("compressor_power_spike")
+                if self._power_spike_streak < POWER_SPIKE_PERSIST_SAMPLES:
+                    # Debounce: don't let a single noisy sample (e.g. a
+                    # defrost heater or icemaker) escalate to critical.
+                    issues.append("compressor_power_spike_transient")
+            else:
+                self._power_spike_streak = 0
 
         if daily_energy is None:
             issues.append("insufficient_energy_window")

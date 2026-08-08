@@ -70,7 +70,7 @@ class ApplianceShieldEntity(CoordinatorEntity[ApplianceShieldCoordinator], Senso
             "manufacturer": "Appliance Shield",
             "name": self._base_name,
             "model": str(metadata.get("appliance_type", "unknown")).replace("_", " ").title(),
-            "configuration_url": "https://github.com/example/appliance_shield",
+            "configuration_url": "https://github.com/nanakayjr/appliance_guard",
         }
 
     @property

@@ -45,11 +45,13 @@ You can re-open the flow later to adjust metadata or swap telemetry sources.
 | `binary_sensor.<name>_compressor_running` | Exposes the live compressor state and recent runtime statistics. |
 | `binary_sensor.<name>_door_open` | Indicates when the heuristics infer a stuck door / seal problem, plus supporting evidence. |
 
-## Health & Scoring Logic (v0.3)
+## Health & Scoring Logic (v0.4)
 
-- **Ambient-normalized daily energy**: Every 24 h Appliance Shield computes the measured kWh/day (integrating power when no cumulative sensor exists) and applies an online linear regression so EEI maps to the official reference temperature. The normalized daily energy, EWMA baseline, and confidence surface as attributes for audits.
+- **Ambient-normalized daily energy**: Every 24 h Appliance Shield computes the measured kWh/day (integrating power when no cumulative sensor exists) and applies an online linear regression so EEI maps to the official reference temperature. The regression requires at least 10 days of data before trusting a non-flat slope, and the resulting correction factor is clamped to a 0.6–1.6 band so a handful of noisy days can never wildly misclassify the energy score.
 - **EU EEI compliance**: Reference consumption follows the delegated regulation lookup (type, volumes, climate class) and applies user-provided manufacturer targets when present. Ambient-corrected energy feeds the primary (A–D) sensor state, while the extended ladder (A–G) and raw EEI are exposed as attributes.
-- **Cycle-informed health checks**: The hysteresis cycle detector contributes Ton/Toff, peak/average watts, idle hours, and runtime ratio into the health score. EWMA residuals, Z-scores, and rule-based door/open inference feed the binary sensors plus a 0–100 health score.
+- **Cycle-informed health checks**: The hysteresis cycle detector contributes Ton/Toff, peak/average watts, idle hours, and runtime ratio into the health score. All anomaly comparisons use a predict-then-update pattern — a cycle or day is scored against the baseline *before* that same sample is folded into the EWMA, so a real regime shift is never diluted by its own contribution.
+- **Robust door/seal detection**: An absolute-threshold rule (median off-time under 3 minutes with >80% recent runtime) flags a stuck-open door from cycle one, without waiting on a learned baseline. A separate multi-day duty-cycle drift tracker (25% above baseline for 3+ consecutive days) flags chronic seal/gasket degradation independent of any single cycle.
+- **Debounced fault escalation**: Power spikes and sensor-unavailable conditions must persist across consecutive coordinator refreshes before escalating to `critical`/`attention`, preventing single noisy samples (e.g. a defrost heater) from causing false alarms, while still surfacing them as lower-severity issues immediately.
 - **Persistent baselines & resets**: Rolling histories, EWMA statistics, and residual sigma are persisted via `storage` so restarts don’t reset confidence. A built-in `appliance_shield.reset_baseline` service clears models if the user services the appliance.
 
 ## Performance & Compliance Notes

@@ -45,6 +45,28 @@ DEFAULT_STORAGE_VERSION = 1
 DEFAULT_REFERENCE_TEMP_C = 25.0
 DAILY_HISTORY_DAYS = 90
 
+# Door-open / stuck-seal detection (absolute thresholds, active even before a
+# baseline has been learned so a wedged-open door is never silently missed).
+DOOR_OPEN_TOFF_MINUTES_ABS = 3.0
+DOOR_OPEN_RUNTIME_RATIO = 0.80
+DOOR_OPEN_RECENT_CYCLES = 5
+
+# Chronic seal/gasket degradation: trailing duty-cycle ratio persistently
+# above baseline for several consecutive days.
+DUTY_DRIFT_THRESHOLD = 0.25
+DUTY_DRIFT_PERSIST_DAYS = 3
+
+# Debounce windows (in consecutive coordinator refreshes) required before a
+# transient reading is escalated to a confirmed fault.
+POWER_SPIKE_PERSIST_SAMPLES = 2
+POWER_UNAVAILABLE_PERSIST_SAMPLES = 3
+
+# Ambient regression guardrails so a handful of noisy days can't produce a
+# wild extrapolated correction factor.
+AMBIENT_MIN_SAMPLES_FOR_SLOPE = 10
+AMBIENT_CORRECTION_MIN = 0.6
+AMBIENT_CORRECTION_MAX = 1.6
+
 HEALTH_STATE_INITIALIZING = "initializing"
 HEALTH_STATE_HEALTHY = "healthy"
 HEALTH_STATE_ATTENTION = "attention"
